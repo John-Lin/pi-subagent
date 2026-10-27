@@ -2,13 +2,13 @@
 
 Observable, persistent Pi subagents for independent reviews, investigations, and delegated implementation.
 
-Each subagent runs in its own tmux session with a dedicated Pi JSONL session. The parent can inspect status, wait for durable results, steer active work, queue follow-ups, or attach directly to the child TUI.
+Each subagent runs in its own [Rex](https://www.superlogical.com/rex/docs) session with a dedicated Pi JSONL session. The parent can inspect status, wait for durable results, steer active work, queue follow-ups, or show the child TUI in the Rex app.
 
 ## Requirements
 
 - Pi
 - Node.js 22.19 or newer
-- tmux
+- Rex, with the `rex` CLI on `PATH` (Rex terminals add it automatically)
 
 ## Install
 
@@ -68,7 +68,15 @@ subagent stop a1b2c3
 subagent list
 ```
 
-Use `/subagent` to select and attach to an active child. The status widget shows active names (or handles for unnamed runs) and their current state.
+Use `/subagent` to select an active child and show its Rex session (`pi-subagent-<handle>`) in the Rex app. This needs the parent Pi to run in a Rex terminal and Remote Control turned on in the app's Settings under Rex Server; otherwise open the session from the app's session list. The status widget shows active names (or handles for unnamed runs) and their current state.
+
+## Tests
+
+```sh
+npm test
+```
+
+The tests drive a real Rex server through the `rex` CLI and create short-lived `pi-subagent-*` sessions. Run inside a Rex terminal with Remote Control on, the `/subagent` switch test briefly shows a test session in the app and switches back.
 
 ## Isolation
 

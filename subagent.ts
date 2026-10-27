@@ -2,24 +2,25 @@
 
 import { randomBytes } from "node:crypto";
 import { existsSync, mkdirSync, readdirSync, renameSync, writeFileSync } from "node:fs";
-import { spawnSync } from "node:child_process";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
 	assistantText,
+	closeRunSession,
 	effectiveRunState,
 	getRunsDir,
 	inboxDir,
+	isRunAlive,
 	launchRun,
 	listRuns,
 	readLatestAssistant,
 	readMetadata,
 	removeRunDir,
+	rexSessionLabel,
 	runDisplayName,
 	isValidRunName,
 	type InboxMessage,
 	type RunMetadata,
-	tmuxSessionExists,
 	updateMetadata,
 	waitForRunShutdown,
 	writeMetadata,
@@ -66,6 +67,10 @@ function getRun(handle: string): RunMetadata {
 	const metadata = readMetadata(runDirForHandle(handle));
 	if (!metadata) fail(`Unknown subagent: ${handle}`);
 	return metadata;
+}
+
+function rexSessionLine(metadata: RunMetadata): string {
+	return `Rex session: ${rexSessionLabel(metadata.handle)} (${metadata.rexSession ?? "not launched"})`;
 }
 
 function generateHandle(): string {
@@ -158,7 +163,6 @@ function spawnSubagent(args: string[]): void {
 	const handle = generateHandle();
 	const runDir = runDirForHandle(handle);
 	const sessionFile = join(runDir, "session.jsonl");
-	const tmuxSession = `pi-subagent-${handle}`;
 	mkdirSync(inboxDir(runDir), { recursive: true, mode: 0o700 });
 	writeFileSync(sessionFile, "", { mode: 0o600 });
 
@@ -176,7 +180,6 @@ function spawnSubagent(args: string[]): void {
 		name,
 		parentSessionId: process.env.PI_SESSION_ID || undefined,
 		parentSessionFile: process.env.PI_SESSION_FILE || undefined,
-		tmuxSession,
 		runDir,
 		sessionFile,
 		cwd,
@@ -193,21 +196,22 @@ function spawnSubagent(args: string[]): void {
 
 	const initialArgs = files.map((file) => `@${file}`);
 	if (prompts.length > 0) initialArgs.push(`Task:\n${prompts.join("\n\n")}`);
+	let launched: RunMetadata;
 	try {
-		launchRun(metadata, initialArgs);
+		launched = launchRun(metadata, initialArgs);
 	} catch (error) {
 		removeRunDir(runDir);
 		throw error;
 	}
 
-	process.stdout.write(`Spawned ${runDisplayName(metadata)}\nState: busy\nAttach: tmux attach -t ${tmuxSession}\n`);
+	process.stdout.write(`Spawned ${runDisplayName(launched)}\nState: busy\n${rexSessionLine(launched)}\n`);
 }
 
 function statusSubagent(args: string[]): void {
 	if (args.length !== 1) usage();
 	const metadata = getRun(args[0]);
 	process.stdout.write(
-		`${runDisplayName(metadata)}: ${effectiveRunState(metadata)} (${metadata.provider}/${metadata.model}, ${metadata.thinking})\nAttach: tmux attach -t ${metadata.tmuxSession}\n`,
+		`${runDisplayName(metadata)}: ${effectiveRunState(metadata)} (${metadata.provider}/${metadata.model}, ${metadata.thinking})\n${rexSessionLine(metadata)}\n`,
 	);
 }
 
@@ -233,7 +237,7 @@ function sendSubagent(args: string[]): void {
 	const message = messageParts.join(" ").trim();
 	if (!message) fail("send requires a message");
 	const metadata = getRun(handle);
-	if (!tmuxSessionExists(metadata.tmuxSession)) fail(`${handle} is not running`);
+	if (!isRunAlive(metadata)) fail(`${handle} is not running`);
 
 	const queueDir = inboxDir(metadata.runDir);
 	mkdirSync(queueDir, { recursive: true, mode: 0o700 });
@@ -286,8 +290,8 @@ async function waitSubagent(args: string[]): Promise<void> {
 async function stopSubagent(args: string[]): Promise<void> {
 	if (args.length !== 1) usage();
 	const metadata = getRun(args[0]);
-	const wasRunning = tmuxSessionExists(metadata.tmuxSession);
-	spawnSync("tmux", ["kill-session", "-t", metadata.tmuxSession], { stdio: "ignore" });
+	const wasRunning = isRunAlive(metadata);
+	closeRunSession(metadata);
 	if (wasRunning) await waitForRunShutdown(metadata.runDir);
 	removeRunDir(metadata.runDir);
 	process.stdout.write(`Stopped ${runDisplayName(metadata)}\n`);

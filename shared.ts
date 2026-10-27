@@ -22,7 +22,8 @@ export interface RunMetadata {
 	parentSessionId?: string;
 	parentSessionFile?: string;
 	childSessionId?: string;
-	tmuxSession: string;
+	/** ID of the Rex session hosting the child pi; set once the run is launched. */
+	rexSession?: string;
 	runDir: string;
 	sessionFile: string;
 	cwd: string;
@@ -103,7 +104,7 @@ export function readMetadata(runDir: string): RunMetadata | undefined {
 			metadata.version !== 1 ||
 			typeof metadata.handle !== "string" ||
 			(metadata.name !== undefined && !isValidRunName(metadata.name)) ||
-			typeof metadata.tmuxSession !== "string" ||
+			(metadata.rexSession !== undefined && typeof metadata.rexSession !== "string") ||
 			typeof metadata.sessionFile !== "string" ||
 			typeof metadata.runDir !== "string"
 		) {
@@ -151,12 +152,61 @@ export function removeRunDir(runDir: string): void {
 	rmSync(runDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
 }
 
-export function tmuxSessionExists(session: string): boolean {
-	return spawnSync("tmux", ["has-session", "-t", session], { stdio: "ignore" }).status === 0;
+/** Session label shown in the Rex app for a run. */
+export function rexSessionLabel(handle: string): string {
+	return `pi-subagent-${handle}`;
 }
 
-/** Start the child pi process for a run in its tmux session. `initialArgs` are only passed on first spawn. */
-export function launchRun(metadata: RunMetadata, initialArgs: string[] = []): void {
+/** Run the rex CLI and return its output, throwing its error message on failure. */
+function rex(args: string[], input?: string): string {
+	const result = spawnSync("rex", args, { encoding: "utf8", input });
+	if (result.status !== 0) {
+		throw new Error(
+			result.error?.message || result.stderr.trim().replace(/^Error: /, "") || `rex ${args.join(" ")} failed`,
+		);
+	}
+	return result.stdout;
+}
+
+function closeRexSession(sessionId: string): void {
+	spawnSync("rex", ["kill", sessionId], { stdio: "ignore" });
+}
+
+/** Destroy the run's Rex session, ending its pi process; a session that is already gone is ignored. */
+export function closeRunSession(metadata: RunMetadata): void {
+	if (metadata.rexSession) closeRexSession(metadata.rexSession);
+}
+
+/**
+ * Ask the Rex app showing `viewerSession` to switch to the run's session. The app must have Remote Control on.
+ * When exactly one app shows `viewerSession` it is targeted; otherwise rex picks the only connected app or fails.
+ */
+export function showRunSession(metadata: RunMetadata, viewerSession: string): void {
+	if (!metadata.rexSession) throw new Error(`${metadata.handle} has no Rex session`);
+	const listed = JSON.parse(rex(["client", "ls", "-s", viewerSession, "--json"])) as {
+		clients?: { client_id: string; info?: { kind?: string } }[];
+	};
+	const apps = (listed.clients ?? []).filter((client) => client.info?.kind === "app");
+	const target = apps.length === 1 ? ["-C", apps[0].client_id] : [];
+	rex([...target, "do", "session.select", `session_id=${metadata.rexSession}`]);
+}
+
+/** A Rex session outlives the program in it, so a run is alive only while its terminal block exists. */
+export function isRunAlive(metadata: RunMetadata): boolean {
+	if (!metadata.rexSession) return false;
+	try {
+		const value = JSON.parse(rex(["block", "ls", "-s", metadata.rexSession, "--json"])) as { blocks?: unknown[] };
+		return (value.blocks?.length ?? 0) > 0;
+	} catch {
+		return false;
+	}
+}
+
+/**
+ * Start the child pi process for a run in a new Rex session and record that session in the run's metadata.
+ * `initialArgs` are only passed on first spawn.
+ */
+export function launchRun(metadata: RunMetadata, initialArgs: string[] = []): RunMetadata {
 	let launcher = "pi";
 	const testLauncher = join(metadata.cwd, "pi-test.sh");
 	try {
@@ -166,43 +216,54 @@ export function launchRun(metadata: RunMetadata, initialArgs: string[] = []): vo
 		// Use the installed pi executable.
 	}
 
-	const result = spawnSync(
-		"tmux",
-		[
-			"new-session",
-			"-d",
-			"-s",
-			metadata.tmuxSession,
-			"-x",
-			"120",
-			"-y",
-			"40",
-			"-c",
-			metadata.cwd,
-			"--",
-			"env",
-			`PI_SUBAGENT_RUN_DIR=${metadata.runDir}`,
-			launcher,
-			"--session",
-			metadata.sessionFile,
-			"--provider",
-			metadata.provider,
-			"--model",
-			metadata.model,
-			"--thinking",
-			metadata.thinking,
-			...(metadata.launchArgs ?? []),
-			...initialArgs,
-		],
-		{ encoding: "utf8" },
-	);
-	if (result.status !== 0) throw new Error(result.stderr.trim() || "Failed to create tmux session");
+	// The terminal runs pi through the login shell so pi and its environment are found as in a normal terminal.
+	const terminal = {
+		flavor: "com.superlogical.terminal.shell",
+		options: {
+			cwd: metadata.cwd,
+			command: [
+				"env",
+				`PI_SUBAGENT_RUN_DIR=${metadata.runDir}`,
+				launcher,
+				"--session",
+				metadata.sessionFile,
+				"--provider",
+				metadata.provider,
+				"--model",
+				metadata.model,
+				"--thinking",
+				metadata.thinking,
+				...(metadata.launchArgs ?? []),
+				...initialArgs,
+			],
+			size: { columns: 120, rows: 40 },
+			// Close the terminal whenever pi exits, even right after starting, so the run reads as exited.
+			exit: { on_completion: true, quick_exit_threshold_ms: 0 },
+		},
+	};
+
+	// Record the session before pi starts so the child's own metadata updates cannot race with this one.
+	const created = JSON.parse(
+		rex(["api", "call", "session.create", "-"], JSON.stringify({ label: rexSessionLabel(metadata.handle) })),
+	) as { session_id: string };
+	try {
+		const launched = updateMetadata(metadata.runDir, { rexSession: created.session_id });
+		if (!launched) throw new Error(`Unknown subagent run: ${metadata.handle}`);
+		rex(
+			["api", "call", "-s", created.session_id, "session.new_window", "-"],
+			JSON.stringify({ layout: { block: terminal } }),
+		);
+		return launched;
+	} catch (error) {
+		closeRexSession(created.session_id);
+		throw error;
+	}
 }
 
 export function effectiveRunState(metadata: RunMetadata): RunState {
 	if (
 		(metadata.state === "starting" || metadata.state === "busy" || metadata.state === "idle") &&
-		!tmuxSessionExists(metadata.tmuxSession)
+		!isRunAlive(metadata)
 	) {
 		return "exited";
 	}
